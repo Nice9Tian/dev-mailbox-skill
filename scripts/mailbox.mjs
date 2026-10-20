@@ -14,7 +14,8 @@
  *   node mailbox.mjs wait-approved [--timeout-min 30]                         等管理员批准；批准了退出 0，到时 3，失效 2
  *   node mailbox.mjs listen [--timeout-min 30]                                等新信（游标自动记）；收到 0，到时 3，审批中 4，失效 2
  *   node mailbox.mjs send --to <id|group:组> --kind <instruction|receipt|question|status> (--body <文本> | --body-file <文件>)
- *                         [--reply-to <消息 id>] [--idempotency-key <键>]
+ *                         [--attach <文件>]…（可写多次，最多 5 个，单个 ≤ 10 MB） [--reply-to <消息 id>] [--idempotency-key <键>]
+ *   node mailbox.mjs download --msg <消息 id> [--out <目录>]                  把这封信的附件下到目录（缺省 ./attachments/<消息 id>/），核对 sha256
  *   node mailbox.mjs ack --msg <消息 id> --state received|processed|failed [--detail <文本>]
  *   node mailbox.mjs directory [--json] | brief <新简报> | renew | leave | message --msg <消息 id> | broadcast --msg <群发 id>
  *   node mailbox.mjs update                                                   把技能更新到 GitHub 上的最新版（join 时自动做一次）
@@ -107,6 +108,66 @@ async function api(method, p, { body, headers = {}, auth = true, timeoutMs = 15_
   return j;
 }
 const isAuthError = (e) => e.status === 401 || e.status === 403;
+
+// ── 附件 ──
+const MAX_ATTACH = 5;
+const MAX_ATTACH_BYTES = 10 * 1024 * 1024;
+/** 传输超时按大小放宽：按每秒 100 KB 估，最少 30 秒、最多 10 分钟 */
+const transferTimeoutMs = (bytes) => Math.min(600_000, Math.max(30_000, Math.ceil(bytes / 100_000) * 1000));
+async function uploadAttachment(file) {
+  const st = fs.statSync(file);
+  if (!st.isFile()) fail(`【信箱】附件 ${file} 不是普通文件。`, 2);
+  if (st.size > MAX_ATTACH_BYTES) fail(`【信箱】附件 ${file} 有 ${st.size} 字节，超过单个 10 MB 上限。`, 2);
+  const t = readToken();
+  if (!t) throw Object.assign(new ApiError('没有令牌'), { status: 401, error: 'no-token' });
+  let res;
+  try {
+    res = await fetch(`${BASE}/attachments`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${t}`, 'Content-Type': 'application/octet-stream', 'X-Filename': encodeURIComponent(path.basename(file)) },
+      body: fs.readFileSync(file),
+      signal: AbortSignal.timeout(transferTimeoutMs(st.size)),
+    });
+  } catch (e) {
+    throw Object.assign(new ApiError(`上传 ${file} 时连不上信箱（${e?.cause?.code ?? e?.name ?? e}）`), { status: 0, error: 'network' });
+  }
+  const j = await res.json().catch(() => null);
+  if (!res.ok || j?.ok === false) {
+    const why = { 403: '你还在审批中、不在任何组，或只收不发（管理员没给发信权限）', 413: '超过单个 10 MB 或你的 100 MB 附件配额', 429: '同时在传的附件太多，稍后再试', 507: '服务器附件存储已满，请告诉用户' }[res.status] ?? '';
+    throw Object.assign(new ApiError(`上传 ${file} 失败：回 ${res.status}${j?.error ? ` ${j.error}` : ''}${why ? `（${why}）` : ''}`), { status: res.status, error: j?.error });
+  }
+  return j.attachment;
+}
+/** 文件名只留安全字符：去目录、控制字符和双向控制符、Windows 不许的字符，处理保留名，截断到 120 字 */
+function safeName(name) {
+  let n = path.basename(String(name ?? '').replace(/\\/g, '/'));
+  n = n.replace(/[\u0000-\u001f\u007f-\u009f‎‏‪-‮⁦-⁩]/g, '').replace(/[<>:"/\\|?*]/g, '_');
+  n = n.slice(0, 120).replace(/^[\s.]+|[\s.]+$/g, '');
+  if (/^(con|prn|aux|nul|com[0-9¹²³]|lpt[0-9¹²³]|conin\$|conout\$)(\s*\..*)?$/i.test(n)) n = `_${n}`;
+  return n || 'attachment';
+}
+/** 目标目录里已有同名项（文件、目录、符号链接）就换成 名字-1.扩展名 */
+function freePath(outDir, name) {
+  const ext = path.extname(name);
+  const stem = name.slice(0, name.length - ext.length);
+  for (let i = 0; ; i++) {
+    const p = path.join(outDir, i ? `${stem}-${i}${ext}` : name);
+    try { fs.lstatSync(p); } catch { return p; }
+  }
+}
+async function downloadAttachment(att, outDir) {
+  const t = readToken();
+  const res = await fetch(`${BASE}/attachments/${encodeURIComponent(att.id)}`, { headers: { Authorization: `Bearer ${t}` }, signal: AbortSignal.timeout(transferTimeoutMs(att.size ?? MAX_ATTACH_BYTES)) });
+  if (!res.ok) throw Object.assign(new ApiError(`下载附件 ${att.name ?? att.id} 回 ${res.status}（不存在、信已过期，或你没有权限）`), { status: res.status });
+  const buf = Buffer.from(await res.arrayBuffer());
+  const sha = crypto.createHash('sha256').update(buf).digest('hex');
+  const want = att.sha256 ?? res.headers.get('x-attachment-sha256');
+  if (want && sha !== want) throw new ApiError(`附件 ${att.name ?? att.id} 校验不对（sha256 ${sha} ≠ ${want}），没有保存`);
+  const p = freePath(outDir, safeName(att.name));
+  fs.writeFileSync(p, buf, { flag: 'wx' });
+  return { id: att.id, name: att.name, path: p, size: buf.length, sha256: sha };
+}
+const fmtAttachments = (list) => (list?.length ? list.map((a) => `${clean(a.name)}（${a.size} 字节，id ${a.id}）`).join('；') : '');
 
 /** 查身份。回 { state: 'none' | 'invalid' | 'pending' | 'active', me } */
 async function whoami() {
@@ -239,10 +300,17 @@ async function main() {
       if (!to || !KINDS.includes(kind)) fail(`用法：send --to <id|group:组> --kind <${KINDS.join('|')}> (--body <文本> | --body-file <文件>) [--reply-to <消息 id>]`, 2);
       const body = has('--body-file') ? fs.readFileSync(arg('--body-file'), 'utf8') : arg('--body');
       if (body === undefined) fail('要给 --body 或 --body-file', 2);
+      const files = argv.flatMap((a, i) => (a === '--attach' && i + 1 < argv.length ? [argv[i + 1]] : []));
+      if (files.length > MAX_ATTACH) fail(`【信箱】一封信最多 ${MAX_ATTACH} 个附件。`, 2);
+      // 先逐个上传；任何一个失败就不发信。重发带附件的信要用新的幂等键（附件 id 每次上传都不同）
+      const attachments = [];
+      for (const f of files) {
+        try { attachments.push((await uploadAttachment(f)).id); } catch (e) { fail(`【信箱】${e.message}。信没有发出。`, e.status === 403 ? 2 : 1); }
+      }
       const key = arg('--idempotency-key', crypto.randomUUID());
       for (let i = 0, backoff = 1000; ; i++, backoff *= 2) {
         try {
-          printJson(await api('POST', '/messages', { body: { to, kind, body, replyTo: arg('--reply-to', null) }, headers: { 'Idempotency-Key': key } }));
+          printJson(await api('POST', '/messages', { body: { to, kind, body, replyTo: arg('--reply-to', null), ...(attachments.length ? { attachments } : {}) }, headers: { 'Idempotency-Key': key } }));
           return 0;
         } catch (e) {
           if (e.status === 403) fail(`【信箱】发不出去（403 ${e.error ?? ''}）：你和 ${to} 不同组，或管理员没给你发给它的权限，或你还在审批中。不是网络问题，别反复重试，请用户到 ${ADMIN_URL} 调整。`, 2);
@@ -292,11 +360,26 @@ async function main() {
       const at = (x) => (x && typeof x === 'object' ? x.at : x) ?? '-';
       say(`消息 ${clean(m.id)}：${clean(m.from)} → ${clean(m.to)}，种类 ${clean(m.kind)}，发出 ${m.createdAt}`);
       say(`状态：收到 ${at(m.state?.received)}｜已处理 ${at(m.state?.processed)}｜失败 ${at(m.state?.failed)}`);
+      if (m.attachments?.length) say(`附件：${fmtAttachments(m.attachments)}（用 download --msg ${clean(m.id)} 下载）`);
       say(`${NOTICE}：\n${clean(m.body)}`);
       return 0;
     }
+    case 'download': {
+      const msg = arg('--msg');
+      if (!msg) fail('用法：download --msg <消息 id> [--out <目录>]', 2);
+      const j = await api('GET', `/messages/${encodeURIComponent(msg)}`);
+      const atts = (j.message ?? j).attachments ?? [];
+      if (!atts.length) { say('【信箱】这封信没有附件。'); return 0; }
+      const outDir = path.resolve(arg('--out', path.join('attachments', safeName(msg))));
+      fs.mkdirSync(outDir, { recursive: true });
+      const saved = [];
+      for (const a of atts) saved.push(await downloadAttachment(a, outDir));
+      say(`【信箱】已下载 ${saved.length} 个附件到 ${outDir}（sha256 都核对过）：`);
+      for (const s of saved) say(`- ${s.path}（${s.size} 字节）`);
+      return 0;
+    }
     default:
-      fail('用法见脚本文件头：join | status | wait-approved | listen | send | ack | directory | brief | renew | leave | message | broadcast | update', 2);
+      fail('用法见脚本文件头：join | status | wait-approved | listen | send | ack | directory | brief | renew | leave | message | broadcast | download | update', 2);
   }
   return 0;
 }
