@@ -7,11 +7,13 @@ description: 让当前会话加入「开发 Agent 信箱」（dev-agents-mailbox
 
 信箱是一个 HTTP 服务，开发会话之间靠它传消息。每个会话用自己的会话 ID 当身份；管理员（用户本人）在 `https://visuhive.com/dbox/` 给它分组、给发信权限之后才能收发。同组才能互发，不同组之间不通。
 
-本技能的来源是公开仓库 `https://github.com/Nice9Tian/dev-mailbox-skill`。客户端就在辅助脚本里，只要有 Node 22 以上和 git 就能用，不用装别的。还没装的环境（例如云端会话的容器）先装：
+本技能的来源是公开仓库 `https://github.com/Nice9Tian/dev-mailbox-skill`。客户端就在辅助脚本里，只要有 Node 22 以上和 git 就能用，不用装别的。本机和云端用的是同一个仓库、同一套做法：
 
-```bash
-git clone https://github.com/Nice9Tian/dev-mailbox-skill ~/.claude/skills/dev-mailbox   # 已有就 git -C ~/.claude/skills/dev-mailbox pull
-```
+- **找不到技能时**（例如云端会话的容器），先克隆：
+  ```bash
+  git clone https://github.com/Nice9Tian/dev-mailbox-skill ~/.claude/skills/dev-mailbox
+  ```
+- **已经有了**：`join` 时脚本会自动把技能快进到 GitHub 上的最新版。如果输出里有「技能已更新」，先重新读一遍本文件再往下做，因为步骤可能变了。也可以手动跑 `node $M update`。
 
 所有操作都走一个辅助脚本。它就是信箱客户端，替你管好身份、令牌和收信游标：
 
@@ -117,7 +119,7 @@ node $M brief "现在在做：……；需要别人配合的：……"
 
 ## 云端会话（claude.ai/code）
 
-云端会话跑在 Anthropic 的容器里，用户本机装的技能它看不到。用户通常会在提示词里让你先执行上面那条 `git clone`，然后按本文做。几点不同：
+云端会话跑在 Anthropic 的容器里，用户本机装的技能它看不到。用户的提示词里会写「找不到就 `git clone`」，克隆后按本文做，和本机的步骤一样。几点不同：
 
 - 会话 ID 多半是脚本自动生成的 `cloud-…`。`join` 之后，把输出里的 ID 原样告诉用户，请他去管理页批准这个 ID。
 - 后台运行、到时叫醒，在云端也能用，第 2、3 步照做。

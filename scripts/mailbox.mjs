@@ -17,15 +17,18 @@
  *                         [--reply-to <消息 id>] [--idempotency-key <键>]
  *   node mailbox.mjs ack --msg <消息 id> --state received|processed|failed [--detail <文本>]
  *   node mailbox.mjs directory [--json] | brief <新简报> | renew | leave | message --msg <消息 id> | broadcast --msg <群发 id>
+ *   node mailbox.mjs update                                                   把技能更新到 GitHub 上的最新版（join 时自动做一次）
  *
  * 环境变量：DEV_AGENTS_MAILBOX_BASE（缺省 https://149-88-94-84.sslip.io/mailbox）、
- *           DEV_AGENTS_MAILBOX_HOME（令牌和游标放哪，缺省 ~/.config/dev-agents-mailbox）。
+ *           DEV_AGENTS_MAILBOX_HOME（令牌和游标放哪，缺省 ~/.config/dev-agents-mailbox）、
+ *           DEV_AGENTS_MAILBOX_NO_UPDATE=1（join 时不自动更新技能）。
  */
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 // ── 代理：fetch 只在启动时读 NODE_USE_ENV_PROXY，所以要带上它重启自己 ──
 if ((process.env.HTTPS_PROXY || process.env.https_proxy) && !process.env.NODE_USE_ENV_PROXY) {
@@ -35,6 +38,8 @@ if ((process.env.HTTPS_PROXY || process.env.https_proxy) && !process.env.NODE_US
 
 const BASE = (process.env.DEV_AGENTS_MAILBOX_BASE || 'https://149-88-94-84.sslip.io/mailbox').replace(/\/+$/, '');
 const ADMIN_URL = 'https://visuhive.com/dbox/';
+const REPO_URL = 'https://github.com/Nice9Tian/dev-mailbox-skill';
+const SKILL_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const HOME = process.env.DEV_AGENTS_MAILBOX_HOME || path.join(os.homedir(), '.config', 'dev-agents-mailbox');
 const ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const KINDS = ['instruction', 'receipt', 'question', 'status'];
@@ -138,9 +143,30 @@ const timeoutMin = () => {
 };
 const printJson = (j) => say(JSON.stringify(j, null, 2));
 
+/**
+ * 把技能目录更新到 GitHub 上的最新版：本机和云端用的都是同一个仓库，这样两边始终一致。
+ * 只在技能目录是本仓库的 git 克隆时做；只快进（--ff-only），本地有改动或分叉就不动、只提示。失败不影响收发信。
+ */
+function updateSkill({ quiet = false } = {}) {
+  const git = (...a) => spawnSync('git', ['-C', SKILL_DIR, ...a], { encoding: 'utf8', timeout: 30_000 });
+  const origin = git('remote', 'get-url', 'origin');
+  if (origin.status !== 0 || !/Nice9Tian\/dev-mailbox-skill/.test(origin.stdout)) {
+    if (!quiet) say(`【信箱】技能目录 ${SKILL_DIR} 不是 ${REPO_URL} 的克隆，不自动更新。`);
+    return;
+  }
+  const before = git('rev-parse', '--short', 'HEAD').stdout.trim();
+  const pull = git('pull', '--ff-only', '-q');
+  if (pull.status !== 0) { say(`【信箱】技能没能自动更新（${(pull.stderr || '').trim().split('\n')[0] || '未知原因'}），先用现有版本。`); return; }
+  const after = git('rev-parse', '--short', 'HEAD').stdout.trim();
+  if (after !== before) say(`【信箱】技能已更新：${before} → ${after}。请重新读一遍 ${path.join(SKILL_DIR, 'SKILL.md')}，按新版做。`);
+  else if (!quiet) say(`【信箱】技能已是最新（${after}）。`);
+}
+
 async function main() {
   switch (cmd) {
+    case 'update': updateSkill(); return 0;
     case 'join': {
+      if (process.env.DEV_AGENTS_MAILBOX_NO_UPDATE !== '1') updateSkill({ quiet: true });
       let w = await whoami();
       if (w.state === 'none') {
         // 先确认令牌文件写得进去，再去占 ID：否则 ID 被占了、令牌却丢了
@@ -270,7 +296,7 @@ async function main() {
       return 0;
     }
     default:
-      fail('用法见脚本文件头：join | status | wait-approved | listen | send | ack | directory | brief | renew | leave | message | broadcast', 2);
+      fail('用法见脚本文件头：join | status | wait-approved | listen | send | ack | directory | brief | renew | leave | message | broadcast | update', 2);
   }
   return 0;
 }
