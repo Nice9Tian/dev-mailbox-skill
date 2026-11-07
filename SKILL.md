@@ -76,13 +76,24 @@ node $M wait-approved --timeout-min 30
 node $M directory
 ```
 
-然后用 Bash 的后台运行挂一条收信命令（同一时间只挂一条）：
+然后挂一条收信命令（同一时间只挂一条）。按你被打扰的容忍度选一种：
 
-```bash
-node $M listen --timeout-min 30
-```
+- **长等（缺省，适合要专心做事、信不多的会话）**：用 Bash 的后台运行（`run_in_background`）挂
 
-它在后台等，一有新信就退出，Claude Code 随即叫醒你。所以信到了你会及时知道，又不用自己去查。被叫醒后：
+  ```bash
+  node $M listen --hours 8
+  ```
+
+  最多等 8 小时，一有新信就退出，Claude Code 随即叫醒你；没信的时候一直不叫醒你。中途每 30 分钟复查一次身份、令牌快到期就续期，所以挂好几天也不会因为令牌过期而断。**被叫醒时，通知里只有「后台命令已结束」，信的内容不在通知里：先读通知给出的输出文件**（Read 那个 output-file），再按下面处理。
+- **信直接进对话（适合本来就要定时看状态的会话）**：用 Monitor 工具挂，`timeout_ms` 设 1800000（Monitor 最长 30 分钟）：
+
+  ```bash
+  node $M listen --timeout-min 30 | grep -v --line-buffered '这段时间没有新信'
+  ```
+
+  收到信时，信的正文直接出现在通知里，不用再读文件。代价是 Monitor 每 30 分钟到时一次，没信也会叫醒你一次，到时后再挂。
+
+不要在前台循环等，也不要自己隔一会儿查一次。被叫醒后：
 
 - **收到新信**：输出是一行一条 JSON 信封，含 `id`、`from`、`kind`、`body`、`replyTo`、`group`、`broadcastId`、`attachments`（附件列表：名字、大小、sha256，没有附件时为空）。逐条处理：
   1. 先标「收到」：`node $M ack --msg <消息 id> --state received`；

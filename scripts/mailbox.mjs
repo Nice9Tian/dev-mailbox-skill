@@ -19,7 +19,8 @@
  *                                                                             审批人：批准或拒绝（理由必填）
  *   node mailbox.mjs status                                                   报告状态；退出码 0 已加入，4 审批中，2 失效或没申报
  *   node mailbox.mjs wait-approved [--timeout-min 30]                         等管理员批准；批准了退出 0，到时 3，失效 2
- *   node mailbox.mjs listen [--timeout-min 30]                                等新信（游标自动记）；收到 0，到时 3，审批中 4，失效 2
+ *   node mailbox.mjs listen [--timeout-min 30 | --hours 8]                    等新信（游标自动记）；收到 0，到时 3，审批中 4，失效 2
+ *                                                                             --hours 长等，最多 8 小时：每 30 分钟复查身份并按需续期，没信时不输出
  *   node mailbox.mjs send --to <id|group:组> --kind <instruction|receipt|question|status> (--body <文本> | --body-file <文件>)
  *                         [--attach <文件>]…（可写多次，最多 5 个，单个 ≤ 10 MB） [--reply-to <消息 id>] [--idempotency-key <键>]
  *   node mailbox.mjs download --msg <消息 id> [--out <目录>]                  把这封信的附件下到目录（缺省 ./attachments/<消息 id>/），核对 sha256
@@ -29,7 +30,8 @@
  *
  * 环境变量：DEV_AGENTS_MAILBOX_BASE（缺省 https://149-88-94-84.sslip.io/mailbox）、
  *           DEV_AGENTS_MAILBOX_HOME（令牌和游标放哪，缺省 ~/.config/dev-agents-mailbox）、
- *           DEV_AGENTS_MAILBOX_NO_UPDATE=1（join 时不自动更新技能）。
+ *           DEV_AGENTS_MAILBOX_NO_UPDATE=1（join 时不自动更新技能）、
+ *           DEV_AGENTS_MAILBOX_LISTEN_SEGMENT_S（listen 每段多少秒，缺省 1800；只给测试用）。
  */
 import fs from 'node:fs';
 import os from 'node:os';
@@ -255,6 +257,23 @@ const timeoutMin = () => {
   if (!(m >= 1 && m <= 30)) fail('--timeout-min 取 1～30（不许无限等）', 2);
   return m;
 };
+/** listen 的总等待分钟数：--hours 1～8（长等）或 --timeout-min 1～30；两个都不许无限等 */
+const listenMinutes = () => {
+  if (arg('--hours') === undefined) return timeoutMin();
+  const h = Number(arg('--hours'));
+  if (!(h > 0 && h <= 8)) fail('--hours 取 0～8 之间（不许无限等）', 2);
+  return h * 60;
+};
+/** 长等中途复查身份：网络或服务出错时返回 null（照常接着等），不像 whoami 那样直接退出 */
+async function whoamiSoft() {
+  if (!readToken()) return { state: 'none' };
+  try {
+    const me = await api('GET', '/whoami');
+    return { state: (me.groups ?? []).length || (me.approves ?? []).length ? 'active' : 'pending', me };
+  } catch (e) {
+    return e.status === 401 ? { state: 'invalid' } : null;
+  }
+}
 const printJson = (j) => say(JSON.stringify(j, null, 2));
 
 /**
@@ -397,12 +416,24 @@ async function main() {
       }
     }
     case 'listen': {
+      const totalMin = listenMinutes();
       const w = await whoami();
       if (w.state !== 'active') { report(w); return w.state === 'pending' ? 4 : 2; }
-      const deadline = Date.now() + timeoutMin() * 60_000;
+      await maybeRenew(w);
+      // --hours：长等（最多 8 小时），内部按 30 分钟一段，每段开头复查身份、按需续期；没信的段不输出任何东西
+      const end = Date.now() + totalMin * 60_000;
       let after = readCursor();
       let backoff = 500;
-      while (Date.now() < deadline) {
+      const SEG = (Number(process.env.DEV_AGENTS_MAILBOX_LISTEN_SEGMENT_S) || 1800) * 1000;
+      let deadline = Math.min(end, Date.now() + SEG);
+      for (;;) {
+        if (Date.now() >= deadline) {
+          if (deadline >= end) break;
+          const w2 = await whoamiSoft();
+          if (w2 && w2.state !== 'active') { report(w2); return w2.state === 'pending' ? 4 : 2; }
+          if (w2) await maybeRenew(w2);
+          deadline = Math.min(end, Date.now() + SEG);
+        }
         const waitS = Math.max(1, Math.min(25, Math.ceil((deadline - Date.now()) / 1000)));
         try {
           const r = await api('GET', `/inbox?after=${after}&wait=${waitS}`, { timeoutMs: (waitS + 15) * 1000 });
